@@ -1122,15 +1122,7 @@ class Package(Base):
             RuntimeError: If Pagure did not give us a 200 code.
         """
         pagure_url = config.get('pagure_url')
-        # Pagure uses plural names for its namespaces such as "rpms" except for
-        # container. Flatpaks were moved from 'modules' to 'flatpaks' - hence
-        # a config setting.
-        if self.type == ContentType.container:
-            namespace = self.type.name
-        elif self.type == ContentType.flatpak:
-            namespace = config.get('pagure_flatpak_namespace')
-        else:
-            namespace = self.type.name + 's'
+        namespace = config.get('pagure_namespaces')[self.type.name]
         package_pagure_url = '{0}/api/0/{1}/{2}?expand_group=1'.format(
             pagure_url.rstrip('/'), namespace, self.external_name)
         package_json = pagure_api_get(package_pagure_url)
@@ -1153,6 +1145,30 @@ class Package(Base):
         # The first list contains usernames with commit access. The second list
         # contains FAS group names with commit access.
         return list(committers), list(groups)
+
+    def hascommitaccess(self, username: str, branchname: str) -> bool:
+        """
+        Check on Pagure if a user has commit access on the package/branch.
+
+        Raises:
+            RuntimeError: If Pagure did not give us a 200 code.
+        """
+        pagure_url = config.get('pagure_url')
+        namespace = config.get('pagure_namespaces')[self.type.name]
+        # Here we override the queried branchname because:
+        # - flatpaks only have one main branch
+        # - modules streams have no direct mapping to branch names
+        # The effect is that we cannot check collaborators rights for specific
+        # streams on modules, so we fall back to old Bodhi behavior
+        if self.type == ContentType.flatpak:
+            branchname = config.get('pagure_flatpak_main_branch')
+        elif self.type == ContentType.module:
+            branchname = config.get('pagure_module_main_branch')
+
+        pagure_query_url = (f'{pagure_url.rstrip("/")}/api/0/{namespace}/{self.external_name}'
+                            f'/hascommit?user={username}&branch={branchname}')
+        pagure_response = pagure_api_get(pagure_query_url)
+        return pagure_response['hascommit']
 
     @validates('builds')
     def validate_builds(self, key, build):
@@ -2079,19 +2095,19 @@ class Update(Base):
         return comments_since_karma_reset
 
     @staticmethod
-    def contains_critpath_component(builds, release_name):
+    def contains_critpath_component(builds, release_branch):
         """
         Determine if there is a critpath component in the builds passed in.
 
         Args:
             builds (list): :class:`Builds <Build>` to be considered.
-            release_name (str): The name of the release, such as "f25".
+            release_branch (str): The name of the git branch associated to the release,
+                such as "f25" or "master".
         Returns:
             bool: ``True`` if the update contains a critical path package, ``False`` otherwise.
         Raises:
             RuntimeError: If the PDC did not give us a 200 code.
         """
-        relname = release_name.lower()
         components = defaultdict(list)
         # Get the mess down to a dict of ptype -> [pname]
         for build in builds:
@@ -2100,7 +2116,7 @@ class Update(Base):
             components[ptype].append(pname)
 
         for ptype in components:
-            if get_critpath_components(relname, ptype, frozenset(components[ptype])):
+            if get_critpath_components(release_branch, ptype, frozenset(components[ptype])):
                 return True
 
         return False
@@ -2168,11 +2184,16 @@ class Update(Base):
     def _greenwave_decision_context(self):
         # We retrieve updates going to testing (status=pending) and updates
         # (status=testing) going to stable.
-        # If the update is pending, we want to know if it can go to testing
+        # We also query on different contexts for critpath and non-critpath
+        # updates.
+        # this is correct if update is already in testing...
+        context = "bodhi_update_push_stable"
         if self.request == UpdateRequest.testing and self.status == UpdateStatus.pending:
-            return 'bodhi_update_push_testing'
-        # Update is already in testing, let's ask if it can go to stable
-        return 'bodhi_update_push_stable'
+            # ...but if it is pending, we want to know if it can go to testing
+            context = "bodhi_update_push_testing"
+        if self.critpath:
+            context = context + "_critpath"
+        return context
 
     def get_test_gating_info(self):
         """
@@ -2291,7 +2312,7 @@ class Update(Base):
         data['user'] = user
         caveats = []
         data['critpath'] = cls.contains_critpath_component(
-            data['builds'], data['release'].name)
+            data['builds'], data['release'].branch)
 
         # Be sure to not add an empty string as alternative title
         # and strip whitespaces from it
@@ -2443,7 +2464,7 @@ class Update(Base):
                     db.delete(b)
 
         data['critpath'] = cls.contains_critpath_component(
-            up.builds, up.release.name)
+            up.builds, up.release.branch)
 
         del(data['builds'])
 
